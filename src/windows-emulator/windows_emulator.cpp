@@ -845,6 +845,7 @@ namespace sogen
         this->kernel_lock_.assert_held();
 
         const auto needed_switch = vcpu.switch_thread.exchange(false);
+        bool woken_by_signal = false;
 
         while (!switch_to_next_thread(*this, vcpu))
         {
@@ -879,7 +880,7 @@ namespace sogen
             }
             else
             {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                woken_by_signal = this->wait_for_idle_wakeup(std::chrono::milliseconds(1));
             }
 
             lock.lock();
@@ -889,6 +890,13 @@ namespace sogen
                 vcpu.switch_thread = needed_switch;
                 return false;
             }
+        }
+
+        // A single signal can ready several threads (e.g. a semaphore released with a count above one), but
+        // only woke this vCPU. Pass the wakeup on; the chain ends at the first vCPU that finds nothing to run.
+        if (woken_by_signal)
+        {
+            this->wake_idle_vcpu();
         }
 
         return true;
@@ -1718,9 +1726,13 @@ namespace sogen
 
     void windows_emulator::request_guest_event_signal(const handle event_handle, const uint32_t maximum_pending)
     {
-        const std::lock_guard lock{this->pending_event_signals_mutex_};
-        auto& pending = this->pending_event_signals_[event_handle.bits];
-        pending = std::min(pending + 1, maximum_pending);
+        {
+            const std::lock_guard lock{this->pending_event_signals_mutex_};
+            auto& pending = this->pending_event_signals_[event_handle.bits];
+            pending = std::min(pending + 1, maximum_pending);
+        }
+
+        this->wake_idle_vcpu();
     }
 
     void windows_emulator::apply_pending_guest_event_signals()
@@ -1777,12 +1789,38 @@ namespace sogen
 
     void windows_emulator::stop()
     {
-        this->should_stop = true;
+        {
+            const std::lock_guard lock{this->idle_wakeup_mutex_};
+            this->should_stop = true;
+        }
+        this->idle_wakeup_cv_.notify_all();
 
         for (uint32_t i = 0; i < this->vcpu_count_; ++i)
         {
             this->vcpu(i).cpu.stop();
         }
+    }
+
+    void windows_emulator::wake_idle_vcpu()
+    {
+        {
+            const std::lock_guard lock{this->idle_wakeup_mutex_};
+            this->pending_idle_wakeups_ = std::min(this->pending_idle_wakeups_ + 1, this->vcpu_count_);
+        }
+        this->idle_wakeup_cv_.notify_one();
+    }
+
+    bool windows_emulator::wait_for_idle_wakeup(const std::chrono::milliseconds timeout)
+    {
+        std::unique_lock lock{this->idle_wakeup_mutex_};
+        this->idle_wakeup_cv_.wait_for(lock, timeout, [this] { return this->pending_idle_wakeups_ > 0 || this->should_stop; });
+        if (this->pending_idle_wakeups_ == 0)
+        {
+            return false;
+        }
+
+        --this->pending_idle_wakeups_;
+        return true;
     }
 
     void windows_emulator::register_factories(utils::buffer_deserializer& buffer)

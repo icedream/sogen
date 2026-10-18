@@ -681,6 +681,7 @@ namespace sogen
 
             c.proc.terminate_thread(*thread, exit_status);
             c.win_emu.callbacks.on_thread_terminated(thread_handle, *thread);
+            c.win_emu.wake_idle_vcpu();
 
             if (thread == c.vcpu.active_thread)
             {
@@ -713,6 +714,7 @@ namespace sogen
                     // subsequent NtWaitForAlertByThreadId consumes it instead of blocking forever. This race-free
                     // delivery is what ntdll's critical sections and SRW locks rely on.
                     t.alerted = true;
+                    c.win_emu.wake_idle_vcpu();
                     return STATUS_SUCCESS;
                 }
             }
@@ -841,6 +843,7 @@ namespace sogen
             if (old_count > 0)
             {
                 thread->suspended -= 1;
+                c.win_emu.wake_idle_vcpu();
             }
 
             return STATUS_SUCCESS;
@@ -1124,6 +1127,7 @@ namespace sogen
                 .apc_argument3 = apc_argument3,
             });
 
+            c.win_emu.wake_idle_vcpu();
             return STATUS_SUCCESS;
         }
 

@@ -401,6 +401,10 @@ namespace sogen
         void request_guest_event_signal(handle event_handle, uint32_t maximum_pending);
         void apply_pending_guest_event_signals();
 
+        // Wakes one idle vCPU because a waiting guest thread may have become ready. Idle vCPUs otherwise only
+        // rescan for ready threads once their idle timeout expires, which delays every lock handoff and wake.
+        void wake_idle_vcpu();
+
         uint64_t get_executed_instructions() const
         {
             return this->executed_instructions_;
@@ -506,6 +510,12 @@ namespace sogen
         kernel_lock kernel_lock_{};
         std::mutex pending_event_signals_mutex_{};
         std::map<uint64_t, uint32_t> pending_event_signals_{};
+
+        std::mutex idle_wakeup_mutex_{};
+        std::condition_variable idle_wakeup_cv_{};
+        uint32_t pending_idle_wakeups_{};
+
+        bool wait_for_idle_wakeup(std::chrono::milliseconds timeout);
 
         // The vCPU currently running a handler under the kernel lock; drives
         // current_thread(). See scoped_dispatch.
