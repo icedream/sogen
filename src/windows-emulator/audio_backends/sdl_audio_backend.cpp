@@ -135,4 +135,99 @@ namespace sogen
         return std::make_unique<sdl_audio_backend>();
     }
 
+    namespace
+    {
+        class sdl_audio_capture_backend final : public audio_capture_backend
+        {
+          public:
+            ~sdl_audio_capture_backend() override
+            {
+                this->stop();
+                if (this->initialized_)
+                {
+                    SDL_QuitSubSystem(SDL_INIT_AUDIO);
+                }
+            }
+
+            bool start(const audio_format& format) override
+            {
+                const std::lock_guard lock{this->mutex_};
+
+                if (this->stream_ && this->format_ == format)
+                {
+                    return true;
+                }
+
+                this->close_stream();
+
+                const auto sdl_format = to_sdl_format(format);
+                if (sdl_format == SDL_AUDIO_UNKNOWN || format.channels == 0 || format.sample_rate == 0)
+                {
+                    return false;
+                }
+
+                if (!this->initialized_)
+                {
+                    this->initialized_ = SDL_InitSubSystem(SDL_INIT_AUDIO);
+                    if (!this->initialized_)
+                    {
+                        return false;
+                    }
+                }
+
+                const SDL_AudioSpec spec{
+                    .format = sdl_format, .channels = static_cast<int>(format.channels), .freq = static_cast<int>(format.sample_rate)};
+                this->stream_ = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_RECORDING, &spec, nullptr, nullptr);
+                if (!this->stream_)
+                {
+                    return false;
+                }
+
+                this->format_ = format;
+                SDL_ResumeAudioStreamDevice(this->stream_);
+                return true;
+            }
+
+            size_t read(void* destination, const size_t size) override
+            {
+                const std::lock_guard lock{this->mutex_};
+
+                if (!this->stream_ || !destination || size == 0)
+                {
+                    return 0;
+                }
+
+                const auto taken = SDL_GetAudioStreamData(this->stream_, destination, static_cast<int>(size));
+                return taken < 0 ? 0 : static_cast<size_t>(taken);
+            }
+
+            void stop() override
+            {
+                const std::lock_guard lock{this->mutex_};
+                this->close_stream();
+            }
+
+          private:
+            void close_stream()
+            {
+                if (this->stream_)
+                {
+                    SDL_DestroyAudioStream(this->stream_);
+                    this->stream_ = nullptr;
+                    this->format_ = {};
+                }
+            }
+
+            mutable std::mutex mutex_{};
+            bool initialized_{false};
+            SDL_AudioStream* stream_{nullptr};
+            audio_format format_{};
+        };
+    }
+
+    std::unique_ptr<audio_capture_backend> create_sdl_audio_capture_backend()
+    {
+        return std::make_unique<sdl_audio_capture_backend>();
+    }
+
 } // namespace sogen

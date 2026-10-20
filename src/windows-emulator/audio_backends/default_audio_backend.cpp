@@ -13,4 +13,13 @@ namespace sogen
         return std::make_unique<null_audio_backend>();
 #endif
     }
+
+    std::unique_ptr<audio_capture_backend> create_default_audio_capture_backend()
+    {
+#if defined(SOGEN_HAS_SDL3)
+        return create_sdl_audio_capture_backend();
+#else
+        return std::make_unique<null_audio_capture_backend>();
+#endif
+    }
 }

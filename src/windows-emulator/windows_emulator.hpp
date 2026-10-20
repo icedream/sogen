@@ -208,6 +208,7 @@ namespace sogen
         std::unique_ptr<network::socket_factory> socket_factory_{};
         std::unique_ptr<ui_backend> ui_backend_{};
         std::unique_ptr<audio_backend> audio_backend_{};
+        std::unique_ptr<audio_capture_backend> audio_capture_backend_{};
         std::unique_ptr<crypt_protect_backend> crypt_protect_backend_{};
         process_manager* process_manager_{};
         std::unique_ptr<console_backend> console_backend_{};
@@ -322,6 +323,11 @@ namespace sogen
         const audio_backend& audio() const
         {
             return *this->audio_backend_;
+        }
+
+        audio_capture_backend& audio_capture()
+        {
+            return *this->audio_capture_backend_;
         }
 
         crypt_protect_backend& crypt_protect()

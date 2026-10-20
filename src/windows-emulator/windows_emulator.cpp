@@ -832,6 +832,7 @@ namespace sogen
           socket_factory_(get_socket_factory(interfaces, settings.network)),
           ui_backend_(get_ui_backend(interfaces)),
           audio_backend_(get_audio_backend(interfaces)),
+          audio_capture_backend_(create_default_audio_capture_backend()),
           crypt_protect_backend_(get_crypt_protect_backend(
               interfaces, settings.emulation_root.empty() ? settings.emulation_root : absolute(settings.emulation_root))),
           process_manager_(interfaces.processes),
