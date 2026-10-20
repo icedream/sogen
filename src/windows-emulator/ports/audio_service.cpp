@@ -120,6 +120,7 @@ namespace sogen
         constexpr uint32_t k_render_data_offset = 0x400;
         constexpr uint32_t k_write_cursor_offset = 0x18;
         constexpr uint32_t k_play_cursor_offset = 0x20;
+        constexpr size_t k_audio_page_size = 0x1000;
 
         constexpr uint64_t k_hns_per_second = 10000000;
         constexpr uint64_t k_default_buffer_duration = k_hns_per_second; // 1 s
@@ -234,6 +235,228 @@ namespace sogen
         // buffer emptying and keeps producing. Because the buffer is plain host memory, the thread touches it
         // directly -- no memory-access hooks (which the WHP backend does not honor) and no calls into the CPU
         // backend from a foreign thread (which is not thread-safe).
+        // Capture mirrors render with the roles swapped: the engine writes samples and advances the write
+        // cursor, the client reads them and advances the read cursor. Both cursors keep the render offsets.
+        // Beyond the cursors the header carries an array of packet records, which is what
+        // IAudioCaptureClient::GetBuffer reports as packet boundaries and device timestamps. Offsets and the
+        // record layout were read off a live Windows 11 capture section by sampling it twice one second apart
+        // and diffing: the fields that move while the device streams silence are the cursors and counters.
+        constexpr uint32_t k_capture_data_offset = 0x400;
+        constexpr uint32_t k_capture_packet_counter = 0x8;
+        constexpr uint32_t k_capture_records_offset = 0x28;
+        constexpr uint32_t k_capture_record_size = 0x28;
+        // A second array sits further into the header. Its entries carry the byte offset of the packet next to
+        // the frame positions, which is what the client-side capture object reads once it sees data; leaving it
+        // zero makes audioses take a null dereference on the first GetNextPacketSize after a packet arrives.
+        constexpr uint32_t k_capture_client_records_offset = 0x200;
+        constexpr uint32_t k_capture_client_record_size = 0x40;
+
+        struct capture_packet_record
+        {
+            uint32_t end_frame{};
+            uint32_t reserved0{};
+            uint32_t start_frame{};
+            uint32_t reserved1{};
+            uint32_t frames{};
+            uint32_t reserved2{};
+            uint64_t device_time_hns{};
+            uint64_t host_time_hns{};
+        };
+
+        static_assert(sizeof(capture_packet_record) == k_capture_record_size);
+
+        struct capture_client_packet_record
+        {
+            uint32_t valid{};
+            uint32_t byte_position{};
+            uint32_t state{};
+            uint32_t reserved0{};
+            uint32_t end_frame{};
+            uint32_t reserved1{};
+            uint32_t start_frame{};
+            uint32_t reserved2{};
+            uint32_t frames{};
+            uint32_t reserved3{};
+            uint64_t device_time_hns{};
+            uint64_t host_time_hns{};
+            uint32_t period_frames{};
+            uint32_t reserved4{};
+        };
+
+        static_assert(sizeof(capture_client_packet_record) == k_capture_client_record_size);
+
+        class capture_stream
+        {
+          public:
+            capture_stream(windows_emulator& win_emu, const stream_audio_format& format, const uint64_t section_size,
+                           const uint8_t* control_header, const size_t control_header_size)
+                : win_emu_(win_emu),
+                  stream_format_(format),
+                  section_size_(section_size),
+                  buffer_bytes_(section_size - k_capture_data_offset),
+                  host_storage_(static_cast<size_t>(section_size) + k_audio_page_size)
+            {
+                this->initialize_host_storage();
+                std::memcpy(this->host_ptr_, control_header, std::min(control_header_size, static_cast<size_t>(k_capture_data_offset)));
+
+                this->guest_address_ =
+                    win_emu.memory.allocate_host_memory(static_cast<size_t>(section_size), this->host_ptr_, memory_permission::read_write);
+                if (this->guest_address_ == 0)
+                {
+                    return;
+                }
+
+                this->mapped_ = true;
+                this->start();
+            }
+
+            ~capture_stream()
+            {
+                this->stopping_.store(true, std::memory_order_release);
+                this->wake_.notify_all();
+                if (this->worker_.joinable())
+                {
+                    this->worker_.join();
+                }
+
+                if (this->mapped_)
+                {
+                    this->win_emu_.audio_capture().stop();
+                    this->win_emu_.memory.release_memory(this->guest_address_, static_cast<size_t>(this->section_size_));
+                }
+            }
+
+            capture_stream(const capture_stream&) = delete;
+            capture_stream& operator=(const capture_stream&) = delete;
+
+            uint64_t guest_address() const
+            {
+                return this->guest_address_;
+            }
+
+            void start()
+            {
+                this->worker_ = std::thread(&capture_stream::run, this);
+            }
+
+          private:
+            void initialize_host_storage()
+            {
+                this->host_ptr_ = reinterpret_cast<uint8_t*>(
+                    (reinterpret_cast<uintptr_t>(this->host_storage_.data()) + (k_audio_page_size - 1)) & ~(k_audio_page_size - 1));
+            }
+
+            void write_header()
+            {
+                const uint32_t version = 1;
+                std::memcpy(this->host_ptr_, &version, sizeof(version));
+                const auto data_size = static_cast<uint32_t>(this->buffer_bytes_);
+                std::memcpy(this->host_ptr_ + 0x4, &data_size, sizeof(data_size));
+            }
+
+            static uint64_t steady_hns()
+            {
+                return std::chrono::duration_cast<std::chrono::duration<uint64_t, std::ratio<1, 10000000>>>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                    .count();
+            }
+
+            void append_record(const uint64_t start_bytes, const uint64_t end_bytes)
+            {
+                const auto block_align = this->block_align();
+                capture_packet_record record{};
+                record.start_frame = static_cast<uint32_t>(start_bytes / block_align);
+                record.end_frame = static_cast<uint32_t>(end_bytes / block_align);
+                record.frames = record.end_frame - record.start_frame;
+                record.device_time_hns = steady_hns();
+                record.host_time_hns = record.device_time_hns;
+
+                const auto slot = this->packets_ % k_capture_max_records;
+                std::memcpy(this->host_ptr_ + k_capture_records_offset + slot * k_capture_record_size, &record, sizeof(record));
+
+                capture_client_packet_record client_record{};
+                client_record.valid = 1;
+                client_record.byte_position = static_cast<uint32_t>(start_bytes);
+                client_record.state = 2;
+                client_record.end_frame = record.end_frame;
+                client_record.start_frame = record.start_frame;
+                client_record.frames = record.frames;
+                client_record.device_time_hns = record.device_time_hns;
+                client_record.host_time_hns = record.host_time_hns;
+                client_record.period_frames = record.frames;
+
+                const auto client_slot = this->packets_ % k_capture_max_client_records;
+                std::memcpy(this->host_ptr_ + k_capture_client_records_offset + client_slot * k_capture_client_record_size, &client_record,
+                            sizeof(client_record));
+
+                ++this->packets_;
+                const auto counter = this->packets_;
+                std::memcpy(this->host_ptr_ + k_capture_packet_counter, &counter, sizeof(counter));
+            }
+
+            uint32_t block_align() const
+            {
+                const auto& format = stream_format_.host_format;
+                return static_cast<uint32_t>(format.channels) * (format.bits_per_sample / 8);
+            }
+
+            void run()
+            {
+                const auto period_frames = std::max<uint64_t>(this->stream_format_.host_format.sample_rate / 100, 1);
+                const auto period_bytes = std::max<uint64_t>(period_frames * this->block_align(), this->block_align());
+                std::vector<uint8_t> chunk(static_cast<size_t>(period_bytes));
+                bool started = false;
+                uint64_t written{};
+
+                while (!this->stopping_.load(std::memory_order_acquire))
+                {
+                    if (!started)
+                    {
+                        started = this->win_emu_.audio_capture().start(this->stream_format_.host_format);
+                    }
+
+                    const auto taken = this->win_emu_.audio_capture().read(chunk.data(), chunk.size());
+                    if (taken == 0)
+                    {
+                        std::unique_lock lock{this->wake_mutex_};
+                        this->wake_.wait_for(lock, std::chrono::milliseconds{5},
+                                             [this] { return this->stopping_.load(std::memory_order_acquire); });
+                        continue;
+                    }
+
+                    uint64_t offset{};
+                    while (offset < taken)
+                    {
+                        const auto ring = written % this->buffer_bytes_;
+                        const auto piece = std::min<uint64_t>(taken - offset, this->buffer_bytes_ - ring);
+                        std::memcpy(this->host_ptr_ + k_capture_data_offset + ring, chunk.data() + offset, static_cast<size_t>(piece));
+                        written += piece;
+                        offset += piece;
+                    }
+
+                    std::memcpy(this->host_ptr_ + k_write_cursor_offset, &written, sizeof(written));
+                    this->append_record(written - taken, written);
+                }
+            }
+
+            static constexpr uint64_t k_capture_max_records = 64;
+            static constexpr uint64_t k_capture_max_client_records = 40;
+
+            windows_emulator& win_emu_;
+            stream_audio_format stream_format_{};
+            uint64_t section_size_{};
+            uint64_t buffer_bytes_{};
+            uint64_t guest_address_{};
+            uint64_t packets_{};
+            bool mapped_{false};
+            std::vector<uint8_t> host_storage_{};
+            uint8_t* host_ptr_{nullptr};
+            std::atomic<bool> stopping_{false};
+            std::condition_variable_any wake_{};
+            std::mutex wake_mutex_{};
+            std::thread worker_{};
+        };
+
         class render_stream
         {
             enum class worker_status
@@ -401,8 +624,6 @@ namespace sogen
             }
 
           private:
-            static constexpr size_t k_audio_page_size = 0x1000;
-
             static size_t validated_storage_size(const state& restored)
             {
                 if (restored.section_size > std::numeric_limits<size_t>::max() - k_audio_page_size ||
@@ -688,13 +909,37 @@ namespace sogen
 
           private:
             std::unique_ptr<render_stream> render_stream_{};
+            std::unique_ptr<capture_stream> capture_stream_{};
             std::optional<stream_audio_format> stream_format_{};
             std::optional<render_stream::state> restored_stream_{};
             handle render_section_handle_{};
+            bool is_capture_{false};
+
+            static bool request_mentions_capture_endpoint(windows_emulator& win_emu, const lpc_request_context& c)
+            {
+                if (!c.send_buffer || c.send_buffer_length < 8)
+                {
+                    return false;
+                }
+
+                std::vector<uint16_t> units(c.send_buffer_length / 2);
+                win_emu.emu().read_memory(c.send_buffer, units.data(), units.size() * sizeof(uint16_t));
+                static constexpr std::array<uint16_t, 7> k_capture_prefix{u'{', u'0', u'.', u'0', u'.', u'1', u'.'};
+                for (size_t i = 0; i + k_capture_prefix.size() <= units.size(); ++i)
+                {
+                    if (std::equal(k_capture_prefix.begin(), k_capture_prefix.end(), units.begin() + static_cast<ptrdiff_t>(i)))
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
 
             void discard_render_stream(windows_emulator& win_emu)
             {
                 this->render_stream_.reset();
+                this->capture_stream_.reset();
                 this->restored_stream_.reset();
                 if (auto* section = win_emu.process.sections.get(this->render_section_handle_))
                 {
@@ -801,6 +1046,11 @@ namespace sogen
                     win_emu.log.warn("[audio-service] Failed to read the RPC stream format or the requested format is unsupported\n");
                     return STATUS_INVALID_PARAMETER;
                 }
+
+                // The endpoint id is an MMDevice id: {0.0.0.<device>}.{guid} for a render endpoint and
+                // {0.0.1.<device>}.{guid} for a capture one. The op4 payload carries it as a conformant
+                // string, so the flow can be read off it directly.
+                this->is_capture_ = request_mentions_capture_endpoint(win_emu, c);
 
                 writer.write_ndr_pointer(true); // [out, string] p6: stream identifier
                 writer.write_ndr_u16string(u"SogenAudioStream", true);
@@ -918,12 +1168,25 @@ namespace sogen
                 // thread (see render_stream). The guest maps this same memory as the shared audio buffer, so the
                 // drain thread reads the committed PCM and advances the play cursor without any CPU-backend hooks.
                 this->discard_render_stream(win_emu);
-                this->render_stream_ = std::make_unique<render_stream>(win_emu, format, buffer_bytes, render_section_size,
-                                                                       render_control_header.data(), render_control_header.size());
-                const auto backing = this->render_stream_->guest_address();
+
+                uint64_t backing = 0;
+                if (this->is_capture_)
+                {
+                    this->capture_stream_ = std::make_unique<capture_stream>(win_emu, format, render_section_size,
+                                                                             render_control_header.data(), render_control_header.size());
+                    backing = this->capture_stream_->guest_address();
+                }
+                else
+                {
+                    this->render_stream_ = std::make_unique<render_stream>(win_emu, format, buffer_bytes, render_section_size,
+                                                                           render_control_header.data(), render_control_header.size());
+                    backing = this->render_stream_->guest_address();
+                }
+
                 if (backing == 0)
                 {
                     this->render_stream_.reset();
+                    this->capture_stream_.reset();
                     return STATUS_NO_MEMORY;
                 }
                 render_section.backing_address = backing;
@@ -963,6 +1226,19 @@ namespace sogen
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
                 };
                 std::memcpy(&system_audio_stream[0x10], &buffer_bytes, sizeof(buffer_bytes));
+
+                // Captured from a live Windows 11 service for both flows: the op7 payload is 120 bytes for a
+                // render and a capture stream alike, and the only structural difference between the two is the
+                // size field at +0x28, 20 for render and 18 for capture. The replayed render wire carries 24
+                // there, which the render client tolerates; a capture client does not, and leaves its capture
+                // object half-built, dereferencing a null member on the first GetNextPacketSize that sees a
+                // packet.
+                if (this->is_capture_)
+                {
+                    constexpr uint32_t capture_stream_size = 18;
+                    std::memcpy(&system_audio_stream[0x28], &capture_stream_size, sizeof(capture_stream_size));
+                }
+
                 writer.write(system_audio_stream.data(), system_audio_stream.size(), 1);
                 return STATUS_SUCCESS;
             }
