@@ -445,12 +445,22 @@ namespace sogen
                     }
 
                     std::memcpy(this->host_ptr_ + k_write_cursor_offset, &written, sizeof(written));
-                    this->append_record(written - taken, written);
+
+                    // A live Windows 11 capture endpoint reports one frame per packet, with or without signal:
+                    // 175,364 packets for 175,364 frames over the probe window. Emitting a record per device
+                    // period instead is a visible shape difference, so advance one frame per record here.
+                    const auto align = this->block_align();
+                    for (uint64_t start = written - taken; start < written; start += align)
+                    {
+                        this->append_record(start, std::min(start + align, written));
+                    }
                 }
             }
 
-            static constexpr uint64_t k_capture_max_records = 64;
-            static constexpr uint64_t k_capture_max_client_records = 40;
+            // The two record arrays are small rolling windows in a live section: +0x28 to +0x200 holds 19
+            // 0x28-byte entries, +0x200 to +0x400 holds 8 0x40-byte entries.
+            static constexpr uint64_t k_capture_max_records = 19;
+            static constexpr uint64_t k_capture_max_client_records = 8;
 
             windows_emulator& win_emu_;
             stream_audio_format stream_format_{};
