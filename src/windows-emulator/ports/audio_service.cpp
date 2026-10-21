@@ -826,8 +826,13 @@ namespace sogen
                         return handle_post_create(writer);
                     case k_audio_opnum_derive_stream_category:
                         return handle_derive_stream_category(win_emu, c, writer);
-                    case 5:
-                        return handle_post_create(writer);
+                    case 5: {
+                        // Answers 68 zero bytes, not the 8 an S_OK-only reply carries. A short reply leaves the
+                        // client stub without its [out] block.
+                        static constexpr std::array<uint8_t, 68> k_op5_reply{};
+                        writer.write(k_op5_reply.data(), k_op5_reply.size(), 1);
+                        return STATUS_SUCCESS;
+                    }
                     default:
                         return STATUS_NOT_SUPPORTED;
                     }
@@ -1238,14 +1243,14 @@ namespace sogen
                 std::memcpy(&system_audio_stream[0x10], &buffer_bytes, sizeof(buffer_bytes));
 
                 // Captured from a live Windows 11 service for both flows: the op7 payload is 120 bytes for a
-                // render and a capture stream alike, and the only structural difference between the two is the
-                // size field at +0x28, 20 for render and 18 for capture. The replayed render wire carries 24
-                // there, which the render client tolerates; a capture client does not, and leaves its capture
-                // object half-built, dereferencing a null member on the first GetNextPacketSize that sees a
-                // packet.
+                // render and a capture stream alike, and apart from the two per-stream GUIDs the only
+                // structural difference is the size field at +0x28. A 26100.8117 guest answers 34 there for a
+                // capture stream and 20 for a render one; an older guest answered 18 and 20. The render client
+                // tolerates a wrong value; the capture client leaves its capture object half-built and then
+                // dereferences a null member on the first GetNextPacketSize that sees a packet.
                 if (this->is_capture_)
                 {
-                    constexpr uint32_t capture_stream_size = 18;
+                    constexpr uint32_t capture_stream_size = 34;
                     std::memcpy(&system_audio_stream[0x28], &capture_stream_size, sizeof(capture_stream_size));
                 }
 
