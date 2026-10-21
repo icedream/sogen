@@ -18,10 +18,20 @@ namespace sogen
         // interface the client bound to.
         //   {923F85B3-BBEE-4EDF-8059-F569FA64A027} v1.6 = MMDevice enumeration (mmdevapi).
         //   {D574D111-6126-49D7-9B86-4DE6B650D4FC} v2.8 = "AudioClientRpc" / IAudioClient streaming (audioses).
+        //   {CD682E75-3749-4A4D-A6B1-C027ED8A4C13} the same AudioClientRpc interface under a rebuilt UUID; a
+        //   Windows 11 build from 26100.8117 on binds this one and opnums, requests and replies otherwise match
+        //   the older one byte for byte. Both are accepted so roots captured before and after that update work.
         constexpr std::array<uint8_t, 16> k_iface_mmdevice_enum = {0xb3, 0x85, 0x3f, 0x92, 0xee, 0xbb, 0xdf, 0x4e,
                                                                    0x80, 0x59, 0xf5, 0x69, 0xfa, 0x64, 0xa0, 0x27};
         constexpr std::array<uint8_t, 16> k_iface_audio_client = {0x11, 0xd1, 0x74, 0xd5, 0x26, 0x61, 0xd7, 0x49,
                                                                   0x9b, 0x86, 0x4d, 0xe6, 0xb6, 0x50, 0xd4, 0xfc};
+        constexpr std::array<uint8_t, 16> k_iface_audio_client_rebuilt = {0x75, 0x2e, 0x68, 0xcd, 0x49, 0x37, 0x4d, 0x4a,
+                                                                          0xa6, 0xb1, 0xc0, 0x27, 0xed, 0x8a, 0x4c, 0x13};
+
+        inline bool is_audio_client_interface(const std::array<uint8_t, 16>& iface)
+        {
+            return iface == k_iface_audio_client || iface == k_iface_audio_client_rebuilt;
+        }
 
         constexpr uint32_t k_audio_opnum_mmdev_get_blob = 0;           // {923F85B3} [out] serialized blob, no [in]
         constexpr uint32_t k_audio_opnum_get_default_endpoint = 25;    // {923F85B3}
@@ -786,7 +796,7 @@ namespace sogen
                                 utils::aligned_binary_writer& writer, std::vector<alpc_reply_handle>& reply_handles) override
             {
                 const auto& iface = this->bound_interface();
-                if (iface == k_iface_audio_client)
+                if (is_audio_client_interface(iface))
                 {
                     switch (procedure_id)
                     {
