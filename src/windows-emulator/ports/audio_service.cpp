@@ -395,7 +395,7 @@ namespace sogen
                 client_record.frames = record.frames;
                 client_record.device_time_hns = record.device_time_hns;
                 client_record.host_time_hns = record.host_time_hns;
-                client_record.period_frames = record.frames;
+                client_record.period_frames = period_frames();
 
                 // The +0x200 array is the client's own delivery window, filled in as it consumes records.
 
@@ -414,10 +414,18 @@ namespace sogen
                 return static_cast<uint32_t>(format.channels) * (format.bits_per_sample / 8);
             }
 
+            // The message's trailing field is compared against the period the client configured; a mismatch is
+            // reported as CLIENT_INPUT_SIZE_MISMATCH and nothing is delivered. The engine period is the one
+            // reported by AudioServerGetDevicePeriod, so express it in frames at the stream rate.
+            uint32_t period_frames() const
+            {
+                return std::max<uint32_t>(stream_format_.host_format.sample_rate / 100, 1);
+            }
+
             void run()
             {
-                const auto period_frames = std::max<uint64_t>(this->stream_format_.host_format.sample_rate / 100, 1);
-                const auto period_bytes = std::max<uint64_t>(period_frames * this->block_align(), this->block_align());
+                const auto period_bytes = std::max<uint64_t>(static_cast<uint64_t>(this->period_frames()) * this->block_align(),
+                                                             static_cast<uint64_t>(this->block_align()));
                 std::vector<uint8_t> chunk(static_cast<size_t>(period_bytes));
                 bool started = false;
                 uint64_t written{};
