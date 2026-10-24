@@ -324,7 +324,6 @@ namespace sogen
                 }
 
                 this->mapped_ = true;
-                this->start();
             }
 
             ~capture_stream()
@@ -353,6 +352,11 @@ namespace sogen
 
             void start()
             {
+                if (this->worker_.joinable())
+                {
+                    return;
+                }
+
                 this->worker_ = std::thread(&capture_stream::run, this);
             }
 
@@ -371,10 +375,14 @@ namespace sogen
                 std::memcpy(this->host_ptr_ + 0x4, &data_size, sizeof(data_size));
             }
 
-            static uint64_t steady_hns()
+            // The client reasons about availability against its own QueryPerformanceCounter, which the
+            // emulator answers from its clock (NtQueryPerformanceCounter returns steady_now() with QpcFrequency
+            // set to that tick period). Timestamping the entries with the host clock instead puts them on a
+            // different time base, and the client then reads the difference as audio that exists.
+            uint64_t steady_hns() const
             {
                 return std::chrono::duration_cast<std::chrono::duration<uint64_t, std::ratio<1, 10000000>>>(
-                           std::chrono::steady_clock::now().time_since_epoch())
+                           this->win_emu_.clock().steady_now().time_since_epoch())
                     .count();
             }
 
@@ -895,6 +903,13 @@ namespace sogen
                     case k_audio_opnum_create_stream:
                         return handle_create_stream(win_emu, c, writer, reply_handles);
                     case k_audio_opnum_start_stream:
+                        // A live endpoint starts delivering only once the client starts the stream, which is why
+                        // GetNextPacketSize still answers 0 immediately after Start. Publishing from stream
+                        // creation instead hands the client data it was never told exists.
+                        if (this->capture_stream_)
+                        {
+                            this->capture_stream_->start();
+                        }
                         return handle_post_create(writer);
                     case k_audio_opnum_stop_stream:
                         return handle_post_create(writer);
