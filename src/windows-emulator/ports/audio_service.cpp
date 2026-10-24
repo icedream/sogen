@@ -252,14 +252,14 @@ namespace sogen
         // record layout were read off a live Windows 11 capture section by sampling it twice one second apart
         // and diffing: the fields that move while the device streams silence are the cursors and counters.
         constexpr uint32_t k_capture_data_offset = 0x400;
-        constexpr uint32_t k_capture_packet_counter = 0x8;
+        // Queue bookkeeping in the control area: the producer index we advance, and the consumer index beside
+        // it that the client owns.
+        constexpr uint32_t k_capture_producer_index = 0xC;
         constexpr uint32_t k_capture_records_offset = 0x28;
         constexpr uint32_t k_capture_record_size = 0x28;
-        // A second array sits further into the header. Its entries carry the byte offset of the packet next to
-        // the frame positions, which is what the client-side capture object reads once it sees data; leaving it
-        // zero makes audioses take a null dereference on the first GetNextPacketSize after a packet arrives.
-        constexpr uint32_t k_capture_client_records_offset = 0x200;
-        constexpr uint32_t k_capture_client_record_size = 0x40;
+        // The timestamp queue the client's clock peeks. A live section carries 0x40-byte entries from +0x200.
+        constexpr uint32_t k_capture_messages_offset = 0x200;
+        constexpr uint32_t k_capture_message_size = 0x40;
 
         struct capture_packet_record
         {
@@ -275,25 +275,30 @@ namespace sogen
 
         static_assert(sizeof(capture_packet_record) == k_capture_record_size);
 
-        struct capture_client_packet_record
+        // One entry of the timestamp queue. The clock derives the elapsed duration from the trailing period
+        // field, and the consumer compares that same field against the period the client configured, so it has
+        // to be the period and not the packet length. Field order read from a live capture: valid flag, the
+        // ring-relative byte offset of the period's PCM, a counter, the frame position, the period in frames at
+        // +0x20, the host QPC and device timestamps, and the period again at +0x38.
+        struct capture_timestamp_message
         {
             uint32_t valid{};
             uint32_t byte_position{};
-            uint32_t state{};
+            uint32_t counter{};
             uint32_t reserved0{};
             uint32_t end_frame{};
             uint32_t reserved1{};
-            uint32_t start_frame{};
             uint32_t reserved2{};
-            uint32_t frames{};
             uint32_t reserved3{};
-            uint64_t device_time_hns{};
-            uint64_t host_time_hns{};
             uint32_t period_frames{};
             uint32_t reserved4{};
+            uint64_t host_time_hns{};
+            uint64_t device_time_hns{};
+            uint32_t message_frames{};
+            uint32_t reserved5{};
         };
 
-        static_assert(sizeof(capture_client_packet_record) == k_capture_client_record_size);
+        static_assert(sizeof(capture_timestamp_message) == k_capture_message_size);
 
         class capture_stream
         {
@@ -371,41 +376,39 @@ namespace sogen
                     .count();
             }
 
-            void append_record(const uint64_t start_bytes, const uint64_t end_bytes)
+            void publish_period(const uint64_t start_bytes, const uint64_t end_bytes)
             {
-                const auto block_align = this->block_align();
-                capture_packet_record record{};
-                record.start_frame = static_cast<uint32_t>(start_bytes / block_align);
-                record.end_frame = static_cast<uint32_t>(end_bytes / block_align);
-                record.frames = record.end_frame - record.start_frame;
-                record.device_time_hns = steady_hns();
-                record.host_time_hns = record.device_time_hns;
+                const auto align = this->block_align();
+                const auto now = steady_hns();
 
-                const auto slot = this->packets_ % k_capture_max_records;
+                capture_packet_record record{};
+                record.start_frame = static_cast<uint32_t>(start_bytes / align);
+                record.end_frame = static_cast<uint32_t>(end_bytes / align);
+                record.frames = period_frames();
+                record.device_time_hns = now;
+                record.host_time_hns = now;
+
+                const auto slot = this->periods_ % k_capture_max_records;
                 std::memcpy(this->host_ptr_ + k_capture_records_offset + slot * k_capture_record_size, &record, sizeof(record));
 
-                capture_client_packet_record client_record{};
-                client_record.valid = 1;
-                // A live capture shows a ring-relative byte offset here (7168, 10752, ... stepping by the
-                // period in bytes), not the absolute cumulative cursor value.
-                client_record.byte_position = static_cast<uint32_t>(start_bytes % this->buffer_bytes_);
-                client_record.state = 2;
-                client_record.end_frame = record.end_frame;
-                client_record.start_frame = record.start_frame;
-                client_record.frames = record.frames;
-                client_record.device_time_hns = record.device_time_hns;
-                client_record.host_time_hns = record.host_time_hns;
-                client_record.period_frames = period_frames();
+                capture_timestamp_message message{};
+                message.valid = 1;
+                message.byte_position = static_cast<uint32_t>(start_bytes % this->buffer_bytes_);
+                message.counter = 1;
+                message.end_frame = record.end_frame;
+                message.period_frames = period_frames();
+                message.host_time_hns = now;
+                message.device_time_hns = now;
+                message.message_frames = period_frames();
 
-                // The +0x200 array is the client's own delivery window, filled in as it consumes records.
+                const auto message_slot = this->periods_ % k_capture_max_messages;
+                std::memcpy(this->host_ptr_ + k_capture_messages_offset + message_slot * k_capture_message_size, &message, sizeof(message));
 
-                const auto client_slot = this->packets_ % k_capture_max_client_records;
-                std::memcpy(this->host_ptr_ + k_capture_client_records_offset + client_slot * k_capture_client_record_size, &client_record,
-                            sizeof(client_record));
-
-                ++this->packets_;
-                const auto counter = this->packets_;
-                std::memcpy(this->host_ptr_ + k_capture_packet_counter, &counter, sizeof(counter));
+                // The queue's producer index; the consumer index beside it belongs to the client. The clock
+                // reads nothing else, so without this the queue always looks empty and no packet is reported.
+                ++this->periods_;
+                const auto producer = static_cast<uint32_t>(this->periods_);
+                std::memcpy(this->host_ptr_ + k_capture_producer_index, &producer, sizeof(producer));
             }
 
             uint32_t block_align() const
@@ -422,11 +425,24 @@ namespace sogen
                 return std::max<uint32_t>(stream_format_.host_format.sample_rate / 100, 1);
             }
 
+            uint64_t period_bytes() const
+            {
+                return std::max<uint64_t>(static_cast<uint64_t>(period_frames()) * block_align(), static_cast<uint64_t>(block_align()));
+            }
+
+            // A queue entry carries a 64-byte header plus one period of PCM, so the ring holds this many
+            // messages; the client validates its index against it and fails the peek when it is zero.
+            uint32_t queue_capacity() const
+            {
+                return std::max<uint32_t>(1u, static_cast<uint32_t>(buffer_bytes_ / (period_bytes() + 64)));
+            }
+
             void run()
             {
-                const auto period_bytes = std::max<uint64_t>(static_cast<uint64_t>(this->period_frames()) * this->block_align(),
-                                                             static_cast<uint64_t>(this->block_align()));
-                std::vector<uint8_t> chunk(static_cast<size_t>(period_bytes));
+                const auto period = this->period_bytes();
+                std::vector<uint8_t> chunk(static_cast<size_t>(period));
+                std::vector<uint8_t> pending{};
+                pending.reserve(static_cast<size_t>(period) * 2);
                 bool started = false;
                 uint64_t written{};
 
@@ -446,42 +462,38 @@ namespace sogen
                         continue;
                     }
 
-                    uint64_t offset{};
-                    while (offset < taken)
+                    pending.insert(pending.end(), chunk.data(), chunk.data() + taken);
+
+                    // Publish whole periods: the queue entry, the service record and the write cursor all move
+                    // per period in a live capture, and the clock turns the entry's period field into the
+                    // duration that becomes the reported packet count.
+                    while (pending.size() >= period)
                     {
-                        const auto ring = written % this->buffer_bytes_;
-                        const auto piece = std::min<uint64_t>(taken - offset, this->buffer_bytes_ - ring);
-                        std::memcpy(this->host_ptr_ + k_capture_data_offset + ring, chunk.data() + offset, static_cast<size_t>(piece));
+                        const auto start = written;
+                        const auto ring = start % this->buffer_bytes_;
+                        const auto piece = std::min<uint64_t>(period, this->buffer_bytes_ - ring);
+                        std::memcpy(this->host_ptr_ + k_capture_data_offset + ring, pending.data(), static_cast<size_t>(piece));
+                        pending.erase(pending.begin(), pending.begin() + static_cast<ptrdiff_t>(piece));
+
                         written += piece;
-                        offset += piece;
-                    }
-
-                    std::memcpy(this->host_ptr_ + k_write_cursor_offset, &written, sizeof(written));
-
-                    // A live Windows 11 capture endpoint reports one frame per packet, with or without signal:
-                    // 175,364 packets for 175,364 frames over the probe window. Emitting a record per device
-                    // period instead is a visible shape difference, so advance one frame per record here.
-                    const auto align = this->block_align();
-                    for (uint64_t start = written - taken; start < written; start += align)
-                    {
-                        this->append_record(start, std::min(start + align, written));
+                        std::memcpy(this->host_ptr_ + k_write_cursor_offset, &written, sizeof(written));
+                        this->publish_period(start, written);
                     }
                 }
             }
 
-            // The two record arrays are small rolling windows in a live section: +0x28 holds three 0x28-byte
-            // entries (ending at +0xA0), and +0x200 to +0x400 holds eight 0x40-byte entries. What follows the
-            // service records is control data, not more records: a live capture keeps live fields at +0xA4 and
-            // +0xA8 and a "DCPE" marker at +0xC0, so a wider array overwrites it.
+            // The record array is a small rolling window: +0x28 holds three 0x28-byte entries (ending at
+            // +0xA0). What follows is control data, not more records: a live capture keeps live fields at
+            // +0xA4 and +0xA8 and a "DCPE" marker at +0xC0, so a wider array overwrites it.
             static constexpr uint64_t k_capture_max_records = 3;
-            static constexpr uint64_t k_capture_max_client_records = 8;
+            static constexpr uint64_t k_capture_max_messages = 8;
 
             windows_emulator& win_emu_;
             stream_audio_format stream_format_{};
             uint64_t section_size_{};
             uint64_t buffer_bytes_{};
             uint64_t guest_address_{};
-            uint64_t packets_{};
+            uint64_t periods_{};
             bool mapped_{false};
             std::vector<uint8_t> host_storage_{};
             uint8_t* host_ptr_{nullptr};
@@ -1211,6 +1223,28 @@ namespace sogen
                 uint64_t backing = 0;
                 if (this->is_capture_)
                 {
+                    // The client copies the section's control area into its own structure and reads the queue
+                    // capacity from it; the values carried over from the render header leave the capacity at
+                    // zero, which fails the peek and leaves every packet count at zero. Fill them for this
+                    // ring: capacity is the number of 64-byte header plus period blocks the ring holds, and
+                    // the two neighbouring fields describe the period span and the usable byte range.
+                    const auto ring_bytes = render_section_size - 0x400;
+                    const auto block_align = static_cast<uint64_t>(format.wave_format.channels) * (format.wave_format.bits_per_sample / 8);
+                    const auto period_frames = std::max<uint32_t>(format.wave_format.sample_rate / 100, 1u);
+                    const auto period = std::max<uint64_t>(static_cast<uint64_t>(period_frames) * block_align, block_align);
+                    const auto capacity = std::max<uint64_t>(1, ring_bytes / (period + 64));
+                    // The client copies this tail range of the control area into its own structure at a fixed
+                    // shift of -0xCC: header +0x150 becomes +0x84 (the queue capacity the peek validates),
+                    // +0x168/+0x16C/+0x170/+0x174 become +0x9C/+0xA0/+0xA4/+0xA8. A live capture answers 92,
+                    // 512, 7168 (= 2 * period bytes), 359968 and 363904 there for a 448-frame period; the
+                    // render header leaves the capacity at zero, which fails the peek and leaves every packet
+                    // count at zero.
+                    patch32(0x150, static_cast<uint32_t>(capacity));
+                    patch32(0x168, period_frames);
+                    patch32(0x16C, static_cast<uint32_t>(period * 2));
+                    patch32(0x170, static_cast<uint32_t>(ring_bytes - (period + 64)));
+                    patch32(0x174, static_cast<uint32_t>(ring_bytes));
+
                     this->capture_stream_ = std::make_unique<capture_stream>(win_emu, format, render_section_size,
                                                                              render_control_header.data(), render_control_header.size());
                     backing = this->capture_stream_->guest_address();
