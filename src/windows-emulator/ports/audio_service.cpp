@@ -1239,8 +1239,16 @@ namespace sogen
                 // 1-based index (0 = null); Ndr64UnionUnmarshall reads the selectors. The earlier hand-typed
                 // copy had these three values shifted 4 bytes early, which misaligned the union/handle parse
                 // and tripped RPC_X_BYTE_COUNT_TOO_SMALL.
+                // The first 16 bytes name the class the client builds for this stream. audioses matches them
+                // against the two-row endpoint-creation table in crossprocessendpointcreation.cpp (rows at
+                // +0x13d250) and calls the matched row's factory pointer. The render row, replayed inline
+                // below, resolves to a stub in the previous function's epilogue; the capture row's factory is
+                // the one that builds the object the capture client reaches through its member pointer, and
+                // without it the client leaves that member null and dereferences it once a packet is queued.
+                constexpr std::array<uint8_t, 16> k_capture_stream_class = {0xa6, 0x6d, 0x4a, 0xf6, 0xaf, 0xe8, 0x7b, 0x4b,
+                                                                            0xbc, 0xa8, 0x84, 0x7a, 0xe7, 0x65, 0xd5, 0x38};
                 std::array<uint8_t, 120> system_audio_stream = {
-                    0x40, 0x37, 0x77, 0xcd, 0x87, 0xb1, 0x74, 0x49, 0xa1, 0xd5, 0xe0, 0xff, // session GUID
+                    0x40, 0x37, 0x77, 0xcd, 0x87, 0xb1, 0x74, 0x49, 0xa1, 0xd5, 0xe0, 0xff, // render stream class
                     0x91, 0x37, 0x22, 0x77, 0x20, 0x62, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, // +0x10: render-buffer byte size
                     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0xd2, 0x14, 0x55, // +0x20: server cookie
                     0xd2, 0x01, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // +0x28: 0x18
@@ -1261,6 +1269,7 @@ namespace sogen
                 if (this->is_capture_)
                 {
                     constexpr uint32_t capture_stream_size = 34;
+                    std::memcpy(&system_audio_stream[0], k_capture_stream_class.data(), k_capture_stream_class.size());
                     std::memcpy(&system_audio_stream[0x28], &capture_stream_size, sizeof(capture_stream_size));
                 }
 
