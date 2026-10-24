@@ -386,7 +386,9 @@ namespace sogen
 
                 capture_client_packet_record client_record{};
                 client_record.valid = 1;
-                client_record.byte_position = static_cast<uint32_t>(start_bytes);
+                // A live capture shows a ring-relative byte offset here (7168, 10752, ... stepping by the
+                // period in bytes), not the absolute cumulative cursor value.
+                client_record.byte_position = static_cast<uint32_t>(start_bytes % this->buffer_bytes_);
                 client_record.state = 2;
                 client_record.end_frame = record.end_frame;
                 client_record.start_frame = record.start_frame;
@@ -394,6 +396,8 @@ namespace sogen
                 client_record.device_time_hns = record.device_time_hns;
                 client_record.host_time_hns = record.host_time_hns;
                 client_record.period_frames = record.frames;
+
+                // The +0x200 array is the client's own delivery window, filled in as it consumes records.
 
                 const auto client_slot = this->packets_ % k_capture_max_client_records;
                 std::memcpy(this->host_ptr_ + k_capture_client_records_offset + client_slot * k_capture_client_record_size, &client_record,
@@ -457,9 +461,11 @@ namespace sogen
                 }
             }
 
-            // The two record arrays are small rolling windows in a live section: +0x28 to +0x200 holds 19
-            // 0x28-byte entries, +0x200 to +0x400 holds 8 0x40-byte entries.
-            static constexpr uint64_t k_capture_max_records = 19;
+            // The two record arrays are small rolling windows in a live section: +0x28 holds three 0x28-byte
+            // entries (ending at +0xA0), and +0x200 to +0x400 holds eight 0x40-byte entries. What follows the
+            // service records is control data, not more records: a live capture keeps live fields at +0xA4 and
+            // +0xA8 and a "DCPE" marker at +0xC0, so a wider array overwrites it.
+            static constexpr uint64_t k_capture_max_records = 3;
             static constexpr uint64_t k_capture_max_client_records = 8;
 
             windows_emulator& win_emu_;
